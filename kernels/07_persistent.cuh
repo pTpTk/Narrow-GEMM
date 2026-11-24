@@ -57,6 +57,8 @@ inline Launch prepare_hopper(int stage, const bf16* a, const bf16* b, float* c,
       if (split > 1) launch_reduce(partial, c, split, stream);
     };
   }
+  if (stages != 2 && stages != 4)
+    throw UnsupportedConfiguration("stages 6-8 support two/four slots; use stages 9-14 for deeper queues");
   if (stages == 2 && batch_k == 1)
     return prepare_hopper_variant<BN, 2, 1>(stage, map_a, map_b, c, partial, split, workers_per_sm, stream);
   if (stages == 2 && batch_k == 2)

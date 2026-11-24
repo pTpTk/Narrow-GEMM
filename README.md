@@ -1,4 +1,4 @@
-# Narrow GEMM on H100: a worklog you can run
+# Narrow GEMM on Hopper: a worklog you can run
 
 A step-by-step tutorial for **one** dense GEMM: **`(M,N,K) = (64,4096,8192)`**,
 BF16 inputs, FP32 accumulation and output. Start with the [tutorial](TUTORIAL.md).
@@ -12,6 +12,11 @@ execution, overlapping copies, split-K, then a handwritten Hopper pipeline.
 [CUTLASS and DeepGEMM source notes](docs/REFERENCES.md) identify exactly which
 upstream ideas inform each experiment.
 
+Stages 9–14 implement the additional applicable techniques from the
+[source audit](docs/SOURCE_AUDIT.md): outstanding MMA groups, fused 3D TMA,
+FP32 TMA stores, Stream-K fixup, A multicast and consumer ping-pong. The audit
+maps each path to exact upstream code and identifies remaining scope limits.
+
 | Stage | File | What changes |
 | --- | --- | --- |
 | 0 | [cuBLAS baseline](include/reference.cuh) | Reference and timed comparison only |
@@ -23,8 +28,14 @@ upstream ideas inform each experiment.
 | 6 | [Warp specialization](kernels/06_warp_specialized.cuh) | One producer warp, two/four ring slots, batched K chunks |
 | 7 | [Persistent workers](kernels/07_persistent.cuh) | Explicit job loop, persistent phases and occupancy-sized worker grid |
 | 8 | [Cooperative TMA](kernels/08_cooperative.cuh) | One 128-thread warpgroup issues future TMA loads and consumes current operands |
+| 9 | [Advanced engine](kernels/09_advanced.cuh) | Fused 3D input TMA, descriptor prefetch/updates, FP32 vector stores |
+| 10 | [Advanced engine](kernels/09_advanced.cuh) | Two outstanding WGMMA groups, delayed operand release, scale-D=0 prologue |
+| 11 | [Advanced engine](kernels/09_advanced.cuh) | FP32 shared vector stores and asynchronous persistent TMA epilogue |
+| 12 | [Advanced engine](kernels/09_advanced.cuh) | Stream-K decomposition and in-kernel last-arrival reduction fixup |
+| 13 | [Cluster multicast](kernels/13_multicast.cuh) | Two adjacent N tiles share A through 3D TMA multicast |
+| 14 | [Consumer ping-pong](kernels/14_pingpong.cuh) | Two consumer WGs alternate whole tiles; TMA output overlap and register redistribution |
 
-All eight custom stages implement their math and scheduling from scratch.
+All fourteen custom stages implement their math and scheduling from scratch.
 They include no CUTLASS, CuTe, DeepGEMM, WMMA, or CUDA barrier/pipeline helper
 headers. [hopper_ptx.cuh](kernels/hopper_ptx.cuh) and
 [wgmma.cuh](kernels/wgmma.cuh) contain our instruction wrappers, descriptor bits,
@@ -58,6 +69,11 @@ The same binary contains the handwritten Hopper stages:
 ../build/narrow_gemm --kernel 6 --bn 64 --split 4
 ../build/narrow_gemm --kernel 7 --bn 64 --split 4
 ../build/narrow_gemm --kernel 8 --bn 64 --split 2 --stages 2 --batch-k 2
+../build/narrow_gemm --kernel 10 --bn 64 --split 2 --stages 6 --batch-k 2
+../build/narrow_gemm --kernel 11 --bn 64 --split 2 --stages 6 --batch-k 2
+../build/narrow_gemm --kernel 12 --bn 64 --split 2
+../build/narrow_gemm --kernel 13 --bn 64 --split 2
+../build/narrow_gemm --kernel 14 --bn 64 --split 2 --batch-k 1
 ```
 
 No reference-library checkout or Python package is needed.
@@ -68,8 +84,9 @@ size, and `WARP_BK=128` builds another candidate. Both shared-memory kernels
 opt into dynamic storage before timing, including configurations above 48 KiB.
 
 For **H200 3g.71gb**, start with the [offline tuning notes](docs/H200_MIG.md).
-Stage 5 remains the serial reference; the new variants are compile-checked
-candidates whose speed needs measuring on your MIG device:
+Stage 5 remains the serial reference. User-reported follow-up measurements put
+stage 7 at 0.751x cuBLAS for BN=64/split=4; other configurations still need
+measurement on your MIG device:
 
 ```bash
 python3 scripts/sweep.py --profile h200-mig --kernels 5,8 \
@@ -89,6 +106,21 @@ kernel stage.
 `__CUDA_ARCH__` is 900 for both variants, so the code also checks the
 architecture-specific feature macro and reports a direct build error.
 
+The advanced paths support `BN={16,32,64,128,256}` and runtime queue depths
+`{2,3,4,5,6,8}`. All tiles divide N exactly. Stage 14 uses two input rings and
+two output buffers, so start with `--batch-k 1`. Launch setup checks shared
+capacity and queries cluster support/residency on the visible device.
+Unsupported configurations print `SKIP` with a reason on stderr; an explicitly
+requested skipped case returns 77, which the sweep handles without stopping.
+Genuine CUDA or correctness failures still fail the sweep. CSV appends `status`
+and `decomposition` to the existing eleven columns.
+
+For stage 12, `Split` is a **worker-budget multiplier**, not uniform K slices:
+workers are capped by both `Ntiles*split` and device occupancy. Fixup is inside
+the timed kernel; there is no standalone reduction launch. Stage 14 reserves
+one CTA per SM for its register pool and ignores the requested worker cap;
+the table reports 1. Other persistent stages clamp the requested cap to occupancy.
+
 ## Collect your own worklog
 
 ```bash
@@ -98,8 +130,17 @@ python3 scripts/sweep.py --csv ../results.csv 2> ../run.log
 python3 scripts/sweep.py --format csv > ../results.csv 2> ../run.log
 ```
 
+For the new techniques, including deeper rings and BN=16/256:
+
+```bash
+python3 scripts/sweep.py --profile advanced --kernels 5,7,8,9,10,11,12,13,14 \
+  --csv ../h200-advanced.csv 2> ../h200-advanced.log
+python3 scripts/check_schedules.py
+```
+
+The second command runs CPU scheduling models, not GPU kernels.
 The default sweep tests `BN={32,64,128}`, with `S={1,2,4,8,16}` for stages 5–8
-and `S={2,4,8,16}` for stage 4. The scalar stage is optional (`--include-scalar`)
+and `S={2,4,8,16}` for stage 4, plus BN=64/splits 1/2/4 for stages 9–14. The scalar stage is optional (`--include-scalar`)
 because it is intentionally slow. Progress, metadata and correctness diagnostics
 go to stderr. Once all cases finish, stdout prints one aligned table grouped
 by kernel, tile width and split. Each row includes its own run's cuBLAS time and
@@ -118,7 +159,7 @@ build output and profiler reports in the parent workspace.
 
 `--timing graph` is the default: capture a batch of complete GEMMs and time its
 replay with CUDA events. `--timing events` times ordinary stream submissions.
-Both include split-K reduction; neither includes allocation, input generation,
+Both include all required reduction/fixup work; neither includes allocation, input generation,
 plan initialization, correctness checks or graph construction. Times are
 steady-state repeated-address measurements, not guaranteed cold-HBM latency.
 
@@ -137,6 +178,8 @@ compute-sanitizer --tool racecheck ../build/narrow_gemm --kernel 8 \
   --iterations 1 --samples 1 --timing events
 ```
 
+The benchmark checks every output before and after timing, then re-poisons
+C/partials and verifies one more invocation without resetting plan state.
 These are instructions to run, not claims of completed GPU validation. The
 [validation notes](docs/VALIDATION.md) record the checks actually completed.
 

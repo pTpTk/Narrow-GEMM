@@ -1,7 +1,7 @@
-# Narrow GEMM on H100: finding parallelism before chasing peak FLOPS
+# Narrow GEMM on Hopper: finding parallelism before chasing peak FLOPS
 
 Let's multiply a matrix with only 64 rows. The other dimensions are large, the
-inputs are BF16, and the hardware is an H100. This sounds like a smaller version
+inputs are BF16, and the hardware is a Hopper H100/H200. This sounds like a smaller version
 of a square Tensor Core GEMM. The first surprise is that a very respectable
 square-GEMM design can expose only 16 independent output tiles.
 
@@ -12,7 +12,9 @@ The objective here is to understand the decisions for a narrow shape. Whether
 our implementation beats cuBLAS is an experiment to run, not a promised result.
 
 For H200 MIG, read the [offline tuning follow-up](docs/H200_MIG.md): it records
-the user-reported starting measurements and the new unmeasured candidates.
+user-reported starting and follow-up measurements. The
+[source audit](docs/SOURCE_AUDIT.md) maps the additional mechanisms now
+implemented in stages 9–14 to their exact upstream sources.
 The full-chip H100 model below should not be scaled blindly to a MIG profile.
 
 All numerical performance estimates below are **analytical models**. There are
@@ -643,47 +645,269 @@ checks, include split-K reduction in the timer, and compare against the fresh
 cuBLAS baseline in each row. The [H200 tuning notes](docs/H200_MIG.md) preserve
 the original measurements and explain the reduced sweep.
 
-## What to borrow from DeepGEMM, and what to leave as another experiment
+## Kernel 9: reduce the work needed to describe and move a K slab
 
-DeepGEMM is more than an FP8 recipe. The pinned tree has a BF16 SM90 kernel
-with TMA, WGMMA, full/empty barriers, register redistribution, persistent
-scheduling and TMA output. [The source guide](docs/REFERENCES.md#deepgemm) links
-the exact files. Reading its BF16 path keeps our arithmetic contract consistent.
+Stages 6–8 already combine two K64 atoms under one barrier. Their producer
+still issues four input-copy instructions per K128 group. Can we issue two?
 
-### Persistent scheduling is useful when there are jobs to schedule
+[The advanced engine](kernels/09_advanced.cuh), with raw instruction wrappers
+in [advanced_ptx.cuh](kernels/advanced_ptx.cuh), changes the tensor map:
 
-A persistent grid runs a bounded set of worker CTAs, each processing several
-logical tiles. It can retain pipeline state, reduce per-tile setup and improve
-job ordering. However, if there are only 64 logical output tiles, 132 workers
-do not create another 68 tiles. Split-K, smaller tiles, grouped requests, or
-batching must supply the missing work first.
+```text
+logical input dimensions: [64, rows, K/64]
+byte strides:              [2*K, 128]
+copy box:                  [64, tile_rows, BatchK]
+shared order:              [BatchK][tile_rows][64]
+```
 
-Stage 7 implements a deliberately simple worker-stride scheduler and retains
-ring state across logical jobs. DeepGEMM adds more sophisticated ordering and
-group handling. Those policies remain source references, not hidden calls.
+A coordinate `(k, row, atom)` still addresses the original element
+`input[row*K + atom*64 + k]`. Global inputs require no transformation. With
+`BatchK=2`, one 3D TMA instruction transfers both independently swizzled atoms
+of A; another does the same for B. The full barrier expects their total bytes.
+The swizzle box's contiguous dimension remains 128 bytes.
 
-### Stream-K addresses work distribution across output tiles and K
+This stage also prefetches the tensor maps, constructs the descriptor high word
+once per atom, uniformizes its low word with a warp shuffle, and increments the
+start-address field for the four K16 MMA instructions. Each atom base remains
+1024-byte aligned. These are concrete ideas from fast.cu's tensor maps and
+DeepGEMM's descriptor setup; the [audit](docs/SOURCE_AUDIT.md) pins their sources.
 
-Uniform split-K assigns S partials to every output tile. Stream-K instead
-distributes a stream of tile/K work among workers, so reduction boundaries can
-be concentrated rather than imposed on every tile. It can help wave tails and
-load balance, but requires partial-result fixup, workspace and synchronization.
-It is distinct from both persistent output-tile scheduling and simple split-K.
+The FP32 output mapping is unchanged mathematically, but adjacent values now
+use explicit `st.global.v2.f32`. FP32 partials retain ordinary write-back
+caching because the reduction reads them immediately. Importing a BF16
+write-through store policy would require a separate traffic experiment.
 
-CUTLASS's pinned SM90 Stream-K scheduler is a useful follow-on reference for
-a handwritten extension. Study its partition boundaries and fixup protocol
-before changing our worker loop. Many upstream tests use M tiles of at least
-128, which would revisit our underfilled-M problem. This tutorial implements
-uniform split-K and persistent workers; it does not implement Stream-K fixup.
+Stage 9 keeps `wait_group 0` after every merged MMA group. It is a persistent
+baseline for the next scheduling change, with the first MMA using scale-D=0
+instead of explicitly clearing the accumulator tuple. Compare it with stage 7
+using identical BN, split, batch and slot settings:
 
-### Multicast saves reused operands, not unique weight bytes
+```bash
+../build/narrow_gemm --kernel 9 --bn 64 --split 2 --stages 2 --batch-k 2
+```
 
-The square-GEMM worklog uses clusters to multicast B across M-neighbor tiles.
-We have one M tile; those neighbors do not exist. A cluster along N could
-multicast **A**, reducing repeated A transfers into SM shared memory. It would
-not eliminate B's 64 MiB of unique weights. Since A is already a small L2
-resident candidate, cluster synchronization and placement costs may outweigh
-the savings. Start with cluster `(1,1,1)` and make multicast a separate test.
+A faster copy issuer does not reduce B's unique byte count. If issue overhead
+was already hidden, this bundle can produce little benefit. Inspect TMA issue
+counts, descriptor instructions and end-to-end time before attributing a win.
+
+## Kernel 10: keep an MMA group outstanding without releasing its operands
+
+In stage 9, the consumer waits for every committed group before issuing the
+next. CUTLASS's inspected SM90 mainloop keeps a group outstanding. The subtle
+part is **which shared-memory buffer becomes reusable**.
+
+Suppose groups 0 and 1 use slots 0 and 1. After committing both, `wait_group 1`
+guarantees group 0 has finished. It says nothing sufficient to release slot 1.
+We need separate read and release cursors:
+
+```text
+prologue:
+    wait full[read]
+    issue first MMA group with scale-D=0; commit
+    read++
+mainloop:
+    wait full[read]
+    issue accumulating group; commit
+    wait until at most one committed group remains
+    release empty[release] through the four consumer warps
+    read++; release++
+tail:
+    wait until no group remains
+    release the final operand slot
+    store completed accumulators
+```
+
+[compute_advanced](kernels/09_advanced.cuh) implements this protocol. Every
+read/release tick uses modulo `slots`, and generation parity derives from
+integer division by `slots`. Ticks continue across persistent jobs; neither
+tick nor phase resets at a tile boundary. A one-group segment takes only the
+prologue and tail, which matters for Stream-K later.
+
+The drain and overlap policies are separate compile-time variants. A runtime
+branch choosing between wait 0 and wait 1 caused CUDA 12.6.85 to insert a
+serialization dependency in an initial implementation. The final new paths
+compile without that diagnostic. That is useful compiler evidence; GPU profiling
+is still needed to assess how much overlap occurs.
+
+```bash
+../build/narrow_gemm --kernel 10 --bn 64 --split 2 --stages 2 --batch-k 2
+../build/narrow_gemm --kernel 10 --bn 64 --split 2 --stages 6 --batch-k 2
+```
+
+Advanced stages accept BN=16/32/64/128/256 and slots=2/3/4/5/6/8. Every tile
+still divides N. Two merged slots minimize storage; six merged slots test a
+DeepGEMM-like depth. At BN=64/K128, six input slots occupy 197,632 bytes, versus
+66,560 for two. Extra depth can hide latency while reducing resident CTAs.
+Runtime resource checks skip combinations exceeding the visible device's
+shared-memory budget. Queue depth remains an experiment, not a monotonic win.
+
+## Kernel 11: put FP32 output on the asynchronous copy engine
+
+After the final MMA drain, the accumulator is in registers. Stage 10 writes
+it directly to global memory. DeepGEMM's FP32 path instead writes float2 pairs
+to shared memory and lets TMA move the tile. Stage 11 implements that path;
+there is no BF16 output conversion.
+
+The output tensor map describes `[N, M*split]` FP32 elements. Slice `s`, tile
+`t` is stored at `(t*BN, s*M)`. With split=1 the map targets C; otherwise it
+targets the stacked partial array consumed by the existing reduction.
+
+One shared output buffer belongs to the consumer WG. For each persistent job:
+
+1. The elected store issuer waits for earlier TMA **shared reads** to finish.
+2. A named barrier synchronizes the 128 consumers before any buffer overwrite.
+3. Each consumer writes its aligned FP32 pairs to shared memory.
+4. Writers fence to the async proxy, then synchronize their consumer group.
+5. The elected thread issues the 2D TMA store and commits its bulk group.
+6. The consumer proceeds to the next job's input/MMA work. Kernel exit waits
+   for global completion of every outstanding store.
+
+[store_advanced_tma](kernels/09_advanced.cuh) contains these steps. Waiting only
+for shared reads before reuse permits global completion to overlap later work.
+A whole-CTA barrier in the consumer loop would also wait for the independent
+producer and could deadlock; the consumer uses its own named barrier.
+
+```bash
+../build/narrow_gemm --kernel 11 --bn 64 --split 2 --stages 6 --batch-k 2
+```
+
+At BN=64, output storage adds 16 KiB, making the six-slot allocation 214,016
+bytes. That may change residency. Compare stage 11 with 10 at equal queue
+settings and inspect occupancy as well as store efficiency. The reduction
+remains timed. Faster partial stores do not remove partial reads or their launch.
+
+## Kernel 12: distribute a stream of tile/K work and fix up only boundaries
+
+Uniform split-K creates S partials for every output tile. Stream-K instead
+partitions the flattened stream of `(N tile, K group)` work across a bounded
+worker grid. Let `T=N/BN`, `G=K/(64*BatchK)`, `U=T*G` and `W=workers`:
+
+```text
+worker w owns units [floor(U*w/W), floor(U*(w+1)/W))
+unit u belongs to tile floor(u/G), K group u%G
+```
+
+The iterator splits an interval at tile boundaries. A worker can own a suffix
+of its first tile, whole middle tiles, and a prefix of its last tile. Whole
+tiles write C directly; partial boundary tiles need fixup. At most two partial
+tile slots are needed per worker. Several workers can still contribute to the
+same tile when an interval is shorter than G.
+
+Stage 12 uses the stage-10 input/MMA engine and implements the fixup itself in
+[stream_k_store](kernels/09_advanced.cuh):
+
+1. Each consumer writes its portion of the FP32 partial tile. Every writer
+   executes a device thread fence, then all 128 consumers synchronize.
+2. The elected thread performs an acquire/release atomic increment of that
+   tile's counter. Iterator boundaries determine the expected contributor count.
+3. Earlier arrivals move on. The last arrival broadcasts its decision to its
+   consumer group, loads all contributors in **fixed worker order**, sums in
+   FP32 and writes final C. Loads bypass L1 to avoid stale prior-replay partials.
+4. After the group's final stores, the elected thread resets the counter.
+   A complete invocation leaves all counters at zero for the next graph replay.
+
+There is no CTA spinning on a different CTA's progress. This avoids requiring
+all workers to be simultaneously resident. The host plan owns the counters and
+two partial slots per worker, initializes them before timing, and captures the
+same workspace for sequential use on its stream. Concurrent invocations must
+use distinct plans/workspaces. This is a specialized Stream-K decomposition
+and last-arrival protocol, rather than a copy of CUTLASS's full scheduler.
+
+```bash
+../build/narrow_gemm --kernel 12 --bn 64 --split 2 --stages 3 --batch-k 2
+```
+
+For **stage 12 only**, `--split` is a worker-budget multiplier:
+`W=min(T*split, SMs*resident_cap)`. It does not impose S equal K slices per tile.
+The table marks this decomposition as `stream-k`; all other partial paths say
+`uniform`. Every counter operation and fixup is inside the timed kernel, with
+no standalone reduction launch or per-replay memset.
+
+If W divides T and ownership aligns with tile boundaries, fixup can disappear.
+If W is much larger than T, most tiles can still have multiple contributors.
+Two slots per worker can allocate more workspace than uniform split-K even
+when requested partial traffic is lower. Measure traffic, wave tails and time;
+Stream-K provides a different tradeoff, not a guaranteed reduction in each cost.
+
+## Kernel 13: multicast A to neighboring N tiles
+
+Our output has one M tile, so B has no neighboring M tile to share with. It has
+many N tiles that use the same A. A two-CTA cluster along N can multicast A.
+
+At BN=64, A has 1 MiB of unique data but 64 MiB of summed tile requests across
+the N dimension. [multicast_gemm](kernels/13_multicast.cuh) pairs adjacent N
+tiles. Each CTA loads its own B, while cluster rank zero issues one 3D A copy
+with multicast mask `0b11`. This halves A copy requests per pair; it leaves
+B's 64 MiB of unique data untouched. Actual HBM/L2 byte savings need profiling.
+
+Two additional lifetime rules make the cluster work:
+
+- Both full barriers must expect A+B bytes **before** the multicast. Each
+  producer arms its barrier and signals rank zero's per-slot two-arrival
+  handshake. Only after both arrive may rank zero multicast A.
+- Both CTAs must finish reading A **before either producer reuses the slot**.
+  Each of the four consumer warp leaders signals both replicas' empty barrier.
+  Each empty generation therefore requires eight arrivals. The producer drains
+  the last used generation of every slot; a final cluster barrier protects the
+  remote shared-memory lifetime before either CTA exits.
+
+Adjacent CTAs keep the same K interval and advance in an even grid stride, so
+their A coordinates and barrier generations stay matched. The host queries
+cluster support and active-cluster occupancy on the actual MIG device and
+launches a legal paired grid. Unavailable configurations report `SKIP`.
+
+```bash
+../build/narrow_gemm --kernel 13 --bn 64 --split 2 --stages 3 --batch-k 2
+```
+
+Compare with stage 10. Placement restrictions, additional barrier traffic and
+cluster startup can exceed the savings when A is already cheap to fetch. This
+stage makes that a measurable hypothesis rather than declaring multicast
+irrelevant just because M is narrow.
+
+## Kernel 14: let a second consumer compute during the first one's epilogue
+
+The previous stages have one consumer WG. An asynchronous output copy helps,
+but arranging its shared tile still costs consumer instructions. CUTLASS's
+ping-pong schedule suggests alternating **whole output jobs** between two WGs.
+
+[pingpong_gemm](kernels/14_pingpong.cuh) uses 384 threads:
+
+```text
+threads   0..127: consumer WG 0, jobs 2*block + 0, then stride 2*grid
+threads 128..255: consumer WG 1, jobs 2*block + 1, then stride 2*grid
+threads 256..383: producer WG, one elected TMA issuer
+```
+
+Each consumer owns an input ring, accumulator tuple, named barrier and shared
+output buffer. A math token starts with WG0. After draining its tile's MMA,
+WG0 passes the token to WG1 and runs its FP32 shared/TMA epilogue. WG1 can now
+compute; after its drain it passes the token back. Neither WG computes padded
+rows or duplicates another WG's output. The producer fairly probes both rings
+with nonblocking barrier tests, so one occupied ring cannot prevent progress
+for its peer.
+
+This full producer WG can legally redistribute registers: all 128 producer
+threads release to 40 registers; each consumer WG requests 128, or 192 for
+BN=256. Launch setup reserves over half the per-SM shared capacity, enforcing
+one resident CTA and preserving enough register pool for the increases. The
+same collective would not be legal if inserted only in the 32-thread producer
+of stages 6–13.
+
+```bash
+../build/narrow_gemm --kernel 14 --bn 64 --split 2 --stages 2 --batch-k 1
+```
+
+Duplicated input/output storage and 384 threads are substantial costs. K64
+atoms are a useful starting point; large BN/K128/depth combinations are skipped
+when they exceed shared capacity. The one-CTA policy may lose memory latency
+hiding even when math/epilogue overlap improves. Compare with stage 11 using
+its own legal resource configurations, then use the advanced sweep to search.
+
+## Workload boundaries
+
+The additional mechanisms above fit the same BF16-input/FP32-output problem.
+Some upstream features serve a different workload:
 
 ### L2 swizzling and Hilbert curves have less room here
 

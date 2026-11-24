@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <stdexcept>
 
 namespace narrow {
 
@@ -19,6 +20,10 @@ static_assert(BK == 32 || BK == 64 || BK == 128);
 constexpr size_t ElementsC = size_t(M) * N;
 using bf16 = __nv_bfloat16;
 using Launch = std::function<void()>;
+
+struct UnsupportedConfiguration : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
 
 inline void cuda_check(cudaError_t status, const char* file, int line) {
   if (status != cudaSuccess) {
