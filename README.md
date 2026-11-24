@@ -76,15 +76,22 @@ architecture-specific feature macro and reports a direct build error.
 
 ```bash
 python3 scripts/model.py --sms 132 > ../model.txt
-python3 scripts/sweep.py > ../results.csv 2> ../run.log
+python3 scripts/sweep.py --csv ../results.csv 2> ../run.log
+# For CSV on stdout instead of the readable table:
+python3 scripts/sweep.py --format csv > ../results.csv 2> ../run.log
 ```
 
 The sweep tests `BN={32,64,128}`, with `S={1,2,4,8,16}` for stages 5–7
-and `S={2,4,8,16}` for stage 4. It preserves a fresh cuBLAS
-row for each process. The scalar stage is optional (`--include-scalar`) because
-it is intentionally slow. Metadata and correctness diagnostics go to stderr;
-stdout contains CSV. Keep `*.csv`, logs, downloaded libraries, build output and
-profiler reports in the parent workspace, as the commands above do.
+and `S={2,4,8,16}` for stage 4. The scalar stage is optional (`--include-scalar`)
+because it is intentionally slow. Progress, metadata and correctness diagnostics
+go to stderr. Once all cases finish, stdout prints one aligned table grouped
+by kernel, tile width and split. Each row includes its own run's cuBLAS time and
+speedup; repeated baseline rows are omitted from this readable summary.
+`--csv PATH` also saves full-precision records with every local baseline, and
+`--format csv` selects that format for stdout. The benchmark binary itself also
+emits its CSV rows together after all checks. On failure the sweep prints only
+completed cases and exits unsuccessfully. Keep CSV, logs, downloaded libraries,
+build output and profiler reports in the parent workspace.
 
 `--timing graph` is the default: capture a batch of complete GEMMs and time its
 replay with CUDA events. `--timing events` times ordinary stream submissions.

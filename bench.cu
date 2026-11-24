@@ -226,8 +226,8 @@ int main(int argc, char** argv) try {
   CUDA_CHECK(cudaStreamSynchronize(stream));
   verify_reference(ha, hb, reference);
   const Timing base = measure(baseline, stream, o);
-  std::puts("kernel,bn,split,timing,median_us,min_us,tflops,speedup_vs_cublas");
-  print_row(0, o, base, base.median_us);
+  struct Result { int kernel; Timing timing; };
+  std::vector<Result> results{{0, base}};
 
   std::vector<int> kernels;
   if (o.kernel == "all") {
@@ -252,10 +252,15 @@ int main(int argc, char** argv) try {
     CUDA_CHECK(cudaMemcpyAsync(actual.data(), c.data, ElementsC * sizeof(float), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     verify(actual, reference, kernel);
-    print_row(kernel, o, t, base.median_us);
+    results.push_back({kernel, t});
   }
   BLAS_CHECK(cublasDestroy(handle));
   CUDA_CHECK(cudaStreamDestroy(stream));
+  // Emit the complete table after all correctness/setup diagnostics, including
+  // when stdout and stderr share a terminal or are redirected into one log.
+  std::puts("kernel,bn,split,timing,median_us,min_us,tflops,speedup_vs_cublas");
+  for (const Result& result : results)
+    print_row(result.kernel, o, result.timing, base.median_us);
   return 0;
 } catch (const std::exception& e) {
   std::fprintf(stderr, "error: %s\n", e.what());
