@@ -8,9 +8,14 @@ and logs live in the parent workspace, outside this repository.
 
 - CUDA 12.6.85 compile-only validation for SM90a passed with all three BN
   variants of stages 2–7, plus the scalar kernel and FP32 reduction: 17 kernel
-  instantiations in total. No warnings, WGMMA serialization diagnostics or
-  register spills were reported. Flags included
-  `-std=c++17 -O3 -DNDEBUG -lineinfo -arch=sm_90a -Xptxas=-v`.
+  instantiations in total. The current build passes without register spills;
+  pipeline serialization diagnostics are recorded below. Flags included
+  `-std=c++17 -O3 -DNDEBUG -lineinfo
+  -gencode=arch=compute_90a,code=sm_90a -Xptxas=-v`.
+- A generic `compute_90` / `sm_90` build was checked and fails at the new
+  architecture feature guard with the required explicit target in the message.
+  CUDA 12.6's `-arch=sm_90a` shorthand also compiles a generic `compute_90`
+  PTX fallback, so the Makefile uses an explicit architecture-specific target.
 - Compilation used only local source and CUDA/cuBLAS development include paths.
   CUTLASS, CuTe and DeepGEMM were absent from the build include path.
 - An emitted-PTX audit found all 17 local kernel entries, no device function
@@ -34,6 +39,12 @@ successful graph capture, dynamic-register behavior or performance.
 ## Compiler resource observations
 
 These are ptxas reports for the current handwritten source, not GPU timings:
+
+The explicit-target CUDA 12.6.85 compile emits `C7519` messages for inserted
+warpgroup fences and `C7515` / `C7520` serialization diagnostics in pipeline
+variants. These are performance diagnostics, not the unsupported-target
+assembly error. Successful compilation does not establish an efficient WGMMA
+pipeline; those diagnostics remain to be investigated before performance claims.
 
 | Stage | BN | Registers / thread | Static shared bytes | Spill loads/stores |
 | --- | ---: | ---: | ---: | ---: |

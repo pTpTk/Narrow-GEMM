@@ -61,6 +61,17 @@ No reference-library checkout or Python package is needed.
 Use `make NVCC=/path/to/cuda/bin/nvcc` if needed. Add
 `NVCCFLAGS=-Xptxas=-v` to inspect registers, shared memory and spills.
 
+If ptxas reports that WGMMA is unsupported on `.target sm_90`, the actual build
+selected generic Hopper instead of `sm_90a`. Rebuild with `make -B`; the
+Makefile uses `-gencode=arch=compute_90a,code=sm_90a`. For a custom build or
+fast.cu wrapper, use that same explicit target. CUDA 12.6's `-arch=sm_90a`
+shorthand also emits generic `compute_90` PTX, so avoid the shorthand for this
+code. Remove any additional generic `sm_90`/`compute_90` targets: every device
+target must support the inline PTX, even when you only intend to run an earlier
+kernel stage.
+`__CUDA_ARCH__` is 900 for both variants, so the code also checks the
+architecture-specific feature macro and reports a direct build error.
+
 ## Collect your own worklog
 
 ```bash

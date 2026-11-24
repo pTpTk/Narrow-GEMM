@@ -1,4 +1,13 @@
 #pragma once
+
+// __CUDA_ARCH__ is 900 for both sm_90 and sm_90a. WGMMA requires the
+// architecture-specific feature target, so a numeric architecture check alone
+// cannot diagnose a generic compute_90 pass. In CUDA 12.6, even -arch=sm_90a
+// shorthand adds that fallback pass; use the explicit gencode target below.
+#if defined(__CUDA_ARCH__) && !defined(__CUDA_ARCH_FEAT_SM90_ALL)
+#error "Hopper GEMM requires -gencode=arch=compute_90a,code=sm_90a. Remove generic sm_90/compute_90 targets; CUDA 12.6 -arch=sm_90a shorthand also adds a generic PTX pass."
+#endif
+
 #include "common.cuh"
 #include <cuda.h>
 #include <cstdint>

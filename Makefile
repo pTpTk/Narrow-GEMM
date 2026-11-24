@@ -1,6 +1,9 @@
 NVCC ?= nvcc
 OUT_DIR ?= ../build
-COMMON_FLAGS := -std=c++17 -O3 -DNDEBUG -lineinfo -arch=sm_90a -I. -Iinclude
+# Avoid -arch=sm_90a shorthand: CUDA 12.6 also emits generic compute_90 PTX,
+# which cannot support this tutorial's unconditionally emitted WGMMA code.
+COMMON_FLAGS := -std=c++17 -O3 -DNDEBUG -lineinfo -I. -Iinclude
+HOPPER_TARGET := -gencode=arch=compute_90a,code=sm_90a
 LIBS := -lcublas -lcuda
 HEADERS := $(wildcard include/*.cuh kernels/*.cuh)
 
@@ -11,7 +14,7 @@ $(OUT_DIR):
 	mkdir -p $@
 
 $(OUT_DIR)/narrow_gemm: bench.cu $(HEADERS) Makefile | $(OUT_DIR)
-	$(NVCC) $(COMMON_FLAGS) $(NVCCFLAGS) $< -o $@ $(LIBS)
+	$(NVCC) $(COMMON_FLAGS) $(NVCCFLAGS) $(HOPPER_TARGET) $< -o $@ $(LIBS)
 
 model:
 	python3 scripts/model.py
