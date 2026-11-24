@@ -195,9 +195,40 @@ template <int BN> struct WgmmaAccumulators {
   }
 };
 
-template <int BN, int Stages> struct alignas(1024) HopperStorage {
-  bf16 a[Stages][BM * HopperBK];
-  bf16 b[Stages][BN * HopperBK];
+// Tuned consumers keep one accumulator definition and a uniform sequence of
+// accumulating instructions. Initialization happens outside the async group;
+// there is no scale-D branch defining a different tuple inside the group.
+// Stage 5 retains the original consume() above as the measured reference.
+template <int BN> struct SteadyWgmmaAccumulators : WgmmaAccumulators<BN> {
+  __device__ __forceinline__ void clear() {
+    #pragma unroll
+    for (int i = 0; i < BN / 2; ++i) this->d[i] = 0.f;
+  }
+
+  __device__ __forceinline__ void begin() {
+    this->compiler_fence();
+    wgmma_fence();
+  }
+
+  __device__ __forceinline__ void issue(const bf16* a, const bf16* b) {
+    #pragma unroll
+    for (int kk = 0; kk < HopperBK; kk += 16)
+      WgmmaInstruction<BN>::template run<true>(
+          this->d, wgmma_descriptor(a + kk), wgmma_descriptor(b + kk));
+  }
+
+  __device__ __forceinline__ void finish() {
+    wgmma_commit();
+    wgmma_wait();
+    this->compiler_fence();
+  }
+};
+
+// Batch independent 64-wide TMA boxes under one completion barrier and one
+// WGMMA commit/wait. The 128B swizzle box stays valid even when BatchK=2.
+template <int BN, int Stages, int BatchK = 1> struct alignas(1024) HopperStorage {
+  bf16 a[Stages][BatchK * BM * HopperBK];
+  bf16 b[Stages][BatchK * BN * HopperBK];
   uint64_t full[Stages];
   uint64_t empty[Stages];
 };

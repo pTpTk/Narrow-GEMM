@@ -1,99 +1,98 @@
 # Validation record
 
-The authoring container has no NVIDIA GPU or system CUDA installation.
-The CUDA compiler, headers, reference checkouts, object/PTX files, mock output
-and logs live in the parent workspace, outside this repository.
+The authoring environment has no GPU. CUDA tools, reference checkouts, compiler
+logs, object/PTX files and CPU/mock audits live in the parent workspace, outside
+this repository. The H200 3g.71gb baseline in [H200_MIG.md](H200_MIG.md) was
+reported by the user; the changed kernels have no measured GPU speedup yet.
 
-## Checks completed for the handwritten implementation
+## Offline checks completed
 
-- CUDA 12.6.85 compile-only validation for SM90a passed with all three BN
-  variants of stages 2–7, plus the scalar kernel and FP32 reduction: 17 kernel
-  instantiations in total. The current build passes without register spills;
-  pipeline serialization diagnostics are recorded below. Flags included
-  `-std=c++17 -O3 -DNDEBUG -lineinfo
+- CUDA 12.6.85 compile-only validation passed for the complete default BK=64
+  build: 47 local kernel instantiations, covering BN=32/64/128 and every
+  stages=2/4, batch-K=1/2 specialization. All 47 reports are spill-free.
+- Separate BK=32 and BK=128 warp-kernel probes compiled all six early-kernel
+  variants per build, without spills. Dynamic shared memory supports the
+  configurations above the static 48-KiB limit.
+- Compiler flags included `-std=c++17 -O3 -DNDEBUG -DNARROW_WARP_BK=64
   -gencode=arch=compute_90a,code=sm_90a -Xptxas=-v`.
-- A generic `compute_90` / `sm_90` build was checked and fails at the new
-  architecture feature guard with the required explicit target in the message.
-  CUDA 12.6's `-arch=sm_90a` shorthand also compiles a generic `compute_90`
-  PTX fallback, so the Makefile uses an explicit architecture-specific target.
-- Compilation used only local source and CUDA/cuBLAS development include paths.
-  CUTLASS, CuTe and DeepGEMM were absent from the build include path.
-- An emitted-PTX audit found all 17 local kernel entries, no device function
-  calls, and the expected `ldmatrix`, warp MMA, `cp.async`, TMA, WGMMA,
-  mbarrier, and `setmaxnreg` instructions.
-- The custom-kernel include audit found no CUTLASS, CuTe, DeepGEMM, WMMA,
-  CUDA barrier/pipeline helper, or cuBLAS headers. The cuBLAS baseline is
-  isolated in `include/reference.cuh`, included only by the benchmark driver.
-- Python syntax, the arithmetic model, sweep CLI and CSV forwarding were
-  checked. The sweep used an explicitly labeled mock executable: 65 processes,
-  129 CSV records including local baselines, covering all supplied stage/BN/S
-  sweep combinations. These checks do not execute GEMM.
-- Makefile command generation, relative documentation paths and the absence
-  of scratch artifacts from the deliverable were checked.
+- The tuned stage-6/7/8 paths emit no WGMMA serialization diagnostics in this
+  compiler. The retained stage-5 reference still emits C7519 fence-insertion
+  and C7515 serialization messages. These are performance diagnostics, not
+  compilation failures; their absence is not a measured speedup.
+- An emitted-PTX audit found 47 local kernel entries, no device function calls,
+  no library-kernel dependencies and no forced `setmaxnreg` instructions.
+  CUTLASS/CuTe/DeepGEMM headers are absent from the build include path. cuBLAS
+  remains isolated in the benchmark reference.
+- The actual C++ option parser and row formatter were exercised in a CPU-only
+  harness: each tuning option is accepted, invalid values rejected, and stage-5
+  metadata remains K=64/one slot regardless of unrelated pipeline flags.
+- The H200-MIG sweep was checked with an explicitly labeled mock executable:
+  24 cases for kernels 5/8, 46 for 5/6/7/8, and 54 for the complete profile.
+  All buffering/worker dimensions survive table and CSV output. Diagnostics
+  precede the table; completed cases survive a simulated failure.
+- CPU state-machine audits exercised 576 randomized producer/TMA/consumer
+  schedules, 24 cooperative schedules, persistent job boundaries, exact K/job
+  coverage and per-box swizzle address bijections. These check schedule/layout
+  invariants, not CUDA execution or numerical correctness.
+- The generic SM90 target rejection, Makefile command generation, documentation
+  paths and absence of scratch artifacts from this repository were checked.
 
-The current code has **not been linked against a complete installed cuBLAS
-runtime or executed on an H100** here. Compilation and PTX inspection do not
-establish numerical correctness, hardware descriptor acceptance, race freedom,
-successful graph capture, dynamic-register behavior or performance.
+The current code has **not been linked against a complete cuBLAS runtime or
+executed on H200/H100 here**. Offline checks cannot establish descriptor
+acceptance, numerical correctness, race freedom, actual residency or speed.
 
-## Compiler resource observations
+## Default compiler resources
 
-These are ptxas reports for the current handwritten source, not GPU timings:
+These are current ptxas register counts and host-computed launch storage sizes,
+not GPU measurements. Stages 6–8 use two slots and two K chunks per slot;
+stages 2–3 use BK=64. All shared allocations below are dynamic.
 
-The explicit-target CUDA 12.6.85 compile emits `C7519` messages for inserted
-warpgroup fences and `C7515` / `C7520` serialization diagnostics in pipeline
-variants. These are performance diagnostics, not the unsupported-target
-assembly error. Successful compilation does not establish an efficient WGMMA
-pipeline; those diagnostics remain to be investigated before performance claims.
-
-| Stage | BN | Registers / thread | Static shared bytes | Spill loads/stores |
+| Stage | BN | Registers / thread | Shared bytes / CTA | Spill loads/stores |
 | --- | ---: | ---: | ---: | ---: |
-| 2 | 32 | 56 | 8,192 | 0 / 0 |
-| 2 | 64 | 64 | 10,240 | 0 / 0 |
-| 2 | 128 | 124 | 15,360 | 0 / 0 |
-| 3 | 32 | 64 | 15,360 | 0 / 0 |
-| 3 | 64 | 72 | 20,480 | 0 / 0 |
-| 3 | 128 | 125 | 30,720 | 0 / 0 |
-| 5 | 32 | 42 | dynamic | 0 / 0 |
-| 5 | 64 | 58 | dynamic | 0 / 0 |
-| 5 | 128 | 90 | dynamic | 0 / 0 |
-| 6 | 32 | 42 | dynamic | 0 / 0 |
-| 6 | 64 | 58 | dynamic | 0 / 0 |
-| 6 | 128 | 90 | dynamic | 0 / 0 |
-| 7 | 32 | 128 | dynamic | 0 / 0 |
-| 7 | 64 | 128 | dynamic | 0 / 0 |
-| 7 | 128 | 128 | dynamic | 0 / 0 |
+| 2 | 32 | 56 | 13,824 | 0 / 0 |
+| 2 | 64 | 64 | 18,432 | 0 / 0 |
+| 2 | 128 | 124 | 27,648 | 0 / 0 |
+| 3 | 32 | 64 | 27,648 | 0 / 0 |
+| 3 | 64 | 78 | 36,864 | 0 / 0 |
+| 3 | 128 | 125 | 55,296 | 0 / 0 |
+| 5 | 32 | 42 | 13,312 | 0 / 0 |
+| 5 | 64 | 58 | 17,408 | 0 / 0 |
+| 5 | 128 | 90 | 25,600 | 0 / 0 |
+| 6 | 32 | 42 | 50,176 | 0 / 0 |
+| 6 | 64 | 58 | 66,560 | 0 / 0 |
+| 6 | 128 | 90 | 99,328 | 0 / 0 |
+| 7 | 32 | 42 | 50,176 | 0 / 0 |
+| 7 | 64 | 58 | 66,560 | 0 / 0 |
+| 7 | 128 | 90 | 99,328 | 0 / 0 |
+| 8 | 32 | 42 | 50,176 | 0 / 0 |
+| 8 | 64 | 58 | 66,560 | 0 / 0 |
+| 8 | 128 | 90 | 99,328 | 0 / 0 |
 
-Stages 5–7 use dynamic shared memory. Their launch setup prints the actual
-allocation, including barriers and alignment padding. Stage 7 explicitly
-requests a 128-register consumer budget and releases producer registers to 40;
-its reported register count does not mean all warpgroups retain 128 registers
-throughout execution. Compiler versions and template choices can change these
-figures. No occupancy or throughput is inferred from this table alone.
+The tuned specialized/persistent kernels use 160 threads; cooperative stage 8
+and reference stage 5 use 128. Register/shared allocation granularity and other
+hardware limits affect residency. The launch setup queries CUDA occupancy and
+prints the actual shared size, legal resident CTAs, visible SMs and worker grid;
+resource counts alone are not throughput predictions.
 
-## Checks to run on H100
+## Required checks on H200
 
-1. Build with a complete CUDA 12.6 toolkit and cuBLAS. No CUTLASS/DeepGEMM
-   checkout is needed.
-2. Run every stage with random inputs. Sweep every BN and split value, including
-   split 32 for the shortest K interval and persistent ring-boundary cases.
-3. Repeat with `ones` and `alternating` inputs. Both timing modes should pass
-   all-output comparisons before and after timing.
-4. Run Compute Sanitizer memory and race checks, particularly on stages 6–7.
-   The README gives commands. Inspect asynchronous operand lifetimes and
-   mbarrier generations across persistent jobs.
-5. Collect unprofiled complete-operation times. Profile partial GEMM and
-   reduction separately to explain costs, while reporting their combined time.
-6. If tuning the ring or register budgets, repeat correctness and resource
-   checks. Compiler acceptance is insufficient evidence for a correct pipeline.
+1. Build and run random, ones and alternating inputs for every candidate.
+2. Check full-output comparisons before and after graph replay. Reduction
+   remains timed; its summation and FP32 output contract are unchanged.
+3. Exercise split=32, stages=4, batch-K=2: persistent jobs can end midway through
+   a ring traversal. Run memcheck and racecheck, especially stages 6–8.
+4. Compare stage 5 against the reported baseline before ranking changed paths.
+   Then run the focused H200-MIG sweep and retain its local cuBLAS comparisons.
+5. Investigate the winning candidates with Nsight Compute. Use unprofiled times
+   for speedups and actual HBM/L2 traffic when interpreting memory limits.
 
 ## Interpretation limits
 
-- No performance table is measured. Roofline, traffic and grid numbers are arithmetic.
-- cuBLAS is `GemmEx`, not a tuned cuBLASLt algorithm search; it is reference-only.
-- Output and partials are FP32. This is not a BF16-output or FP8 benchmark.
-- Timing is repeated-address steady state. No cold-cache guarantee is made.
-- Graph construction and tensor-map encoding are untimed; reduction is timed.
-- One aligned shape is supported. Editing dimensions requires revisiting
-  bounds, fragment layouts, reduction sizes, TMA boxes, descriptor fields,
-  shared alignment and workspace sizes.
+- Baseline timings in the H200 note are user-reported. There are no timings for
+  the changed implementations in this validation record.
+- cuBLAS uses GemmEx, not an exhaustive cuBLASLt algorithm search.
+- Inputs are BF16; accumulators, partials and output are FP32.
+- Timing is repeated-address steady state, not guaranteed cold-cache latency.
+- Tensor-map encoding, occupancy queries and graph construction are untimed.
+- One aligned shape is supported. Dimension/layout changes need a fresh audit
+  of bounds, fragments, descriptors, shared alignment, reduction and workspace.

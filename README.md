@@ -20,10 +20,11 @@ upstream ideas inform each experiment.
 | 3 | [Asynchronous copies](kernels/03_async.cuh) | Two shared-memory buffers and `cp.async` |
 | 4 | [Split-K](kernels/04_split_k.cuh) | More CTAs, FP32 partials, deterministic reduction |
 | 5 | [TMA/WGMMA](kernels/05_tma_wgmma.cuh) | Hand-encoded layouts, raw TMA and WGMMA PTX |
-| 6 | [Warp specialization](kernels/06_warp_specialized.cuh) | Producer/consumer warpgroups, a three-slot ring and transaction barriers |
-| 7 | [Persistent workers](kernels/07_persistent.cuh) | Explicit job loop, persistent ring phases and register redistribution |
+| 6 | [Warp specialization](kernels/06_warp_specialized.cuh) | One producer warp, two/four ring slots, batched K chunks |
+| 7 | [Persistent workers](kernels/07_persistent.cuh) | Explicit job loop, persistent phases and occupancy-sized worker grid |
+| 8 | [Cooperative TMA](kernels/08_cooperative.cuh) | One 128-thread warpgroup issues future TMA loads and consumes current operands |
 
-All seven custom stages implement their math and scheduling from scratch.
+All eight custom stages implement their math and scheduling from scratch.
 They include no CUTLASS, CuTe, DeepGEMM, WMMA, or CUDA barrier/pipeline helper
 headers. [hopper_ptx.cuh](kernels/hopper_ptx.cuh) and
 [wgmma.cuh](kernels/wgmma.cuh) contain our instruction wrappers, descriptor bits,
@@ -33,7 +34,8 @@ cuBLAS is called only by the benchmark reference. No GEMM work is delegated.
 
 ## Build and run
 
-Use Linux, an H100, a compatible driver, and **CUDA Toolkit 12.6** with cuBLAS.
+Use Linux, a Hopper H100/H200 (including MIG), a compatible driver, and
+**CUDA Toolkit 12.6** with cuBLAS.
 The target is `sm_90a`; this is deliberately not a portable GPU library. CUDA
 12.6.85 compile checks were performed for all stages; see
 [validation status](docs/VALIDATION.md). **GPU execution and performance have not
@@ -55,11 +57,26 @@ The same binary contains the handwritten Hopper stages:
 ../build/narrow_gemm --kernel 5 --bn 64 --split 4
 ../build/narrow_gemm --kernel 6 --bn 64 --split 4
 ../build/narrow_gemm --kernel 7 --bn 64 --split 4
+../build/narrow_gemm --kernel 8 --bn 64 --split 2 --stages 2 --batch-k 2
 ```
 
 No reference-library checkout or Python package is needed.
 Use `make NVCC=/path/to/cuda/bin/nvcc` if needed. Add
 `NVCCFLAGS=-Xptxas=-v` to inspect registers, shared memory and spills.
+Stages 2–4 now use BK=64; `make -B WARP_BK=32` reproduces the original K-tile
+size, and `WARP_BK=128` builds another candidate. Both shared-memory kernels
+opt into dynamic storage before timing, including configurations above 48 KiB.
+
+For **H200 3g.71gb**, start with the [offline tuning notes](docs/H200_MIG.md).
+Stage 5 remains the serial reference; the new variants are compile-checked
+candidates whose speed needs measuring on your MIG device:
+
+```bash
+python3 scripts/sweep.py --profile h200-mig --kernels 5,8 \
+  --csv ../h200-first.csv 2> ../h200-first.log
+python3 scripts/sweep.py --profile h200-mig --kernels 5,6,7,8 \
+  --csv ../h200-pipelines.csv 2> ../h200-pipelines.log
+```
 
 If ptxas reports that WGMMA is unsupported on `.target sm_90`, the actual build
 selected generic Hopper instead of `sm_90a`. Rebuild with `make -B`; the
@@ -81,12 +98,17 @@ python3 scripts/sweep.py --csv ../results.csv 2> ../run.log
 python3 scripts/sweep.py --format csv > ../results.csv 2> ../run.log
 ```
 
-The sweep tests `BN={32,64,128}`, with `S={1,2,4,8,16}` for stages 5–7
+The default sweep tests `BN={32,64,128}`, with `S={1,2,4,8,16}` for stages 5–8
 and `S={2,4,8,16}` for stage 4. The scalar stage is optional (`--include-scalar`)
 because it is intentionally slow. Progress, metadata and correctness diagnostics
 go to stderr. Once all cases finish, stdout prints one aligned table grouped
 by kernel, tile width and split. Each row includes its own run's cuBLAS time and
 speedup; repeated baseline rows are omitted from this readable summary.
+K tile, ring slots and persistent worker cap are shown too. For stages 6–8,
+`--stages 2|4` controls ring slots and `--batch-k 1|2` controls 64-wide chunks
+per MMA group. Stage 7's `--workers-per-sm 0` uses device occupancy;
+`1`, `2` or `4` requests a cap, clamped to legal residency. Actual SM count,
+residency and worker grid are logged; no full-GPU SM count is assumed for MIG.
 `--csv PATH` also saves full-precision records with every local baseline, and
 `--format csv` selects that format for stdout. The benchmark binary also defaults
 to a padded table; pass it `--format csv` for machine-readable output. The sweep
@@ -110,6 +132,8 @@ compute-sanitizer --tool racecheck ../build/narrow_gemm --kernel 4 \
 compute-sanitizer --tool memcheck ../build/narrow_gemm --kernel 7 \
   --iterations 1 --samples 1 --timing events
 compute-sanitizer --tool racecheck ../build/narrow_gemm --kernel 6 \
+  --iterations 1 --samples 1 --timing events
+compute-sanitizer --tool racecheck ../build/narrow_gemm --kernel 8 \
   --iterations 1 --samples 1 --timing events
 ```
 

@@ -5,7 +5,8 @@ namespace narrow {
 
 template <int BN>
 __global__ void mma_gemm(const bf16* a, const bf16* b, float* c) {
-  __shared__ Tiles<BN, 1> smem;
+  extern __shared__ __align__(32) unsigned char warp_storage[];
+  auto& smem = *reinterpret_cast<Tiles<BN, 1>*>(warp_storage);
   Accumulators<BN> acc;
   acc.clear();
   b += blockIdx.x * BN * K;
@@ -20,8 +21,14 @@ __global__ void mma_gemm(const bf16* a, const bf16* b, float* c) {
 }
 
 template <int BN>
+inline void configure_mma() {
+  CUDA_CHECK(cudaFuncSetAttribute(mma_gemm<BN>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Tiles<BN, 1>)));
+}
+
+template <int BN>
 inline void launch_mma(const bf16* a, const bf16* b, float* c, cudaStream_t stream) {
-  mma_gemm<BN><<<N / BN, Threads, 0, stream>>>(a, b, c);
+  mma_gemm<BN><<<N / BN, Threads, sizeof(Tiles<BN, 1>), stream>>>(a, b, c);
 }
 
 }  // namespace narrow

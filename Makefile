@@ -1,8 +1,9 @@
 NVCC ?= nvcc
 OUT_DIR ?= ../build
+WARP_BK ?= 64
 # Avoid -arch=sm_90a shorthand: CUDA 12.6 also emits generic compute_90 PTX,
 # which cannot support this tutorial's unconditionally emitted WGMMA code.
-COMMON_FLAGS := -std=c++17 -O3 -DNDEBUG -lineinfo -I. -Iinclude
+COMMON_FLAGS := -std=c++17 -O3 -DNDEBUG -DNARROW_WARP_BK=$(WARP_BK) -lineinfo -I. -Iinclude
 HOPPER_TARGET := -gencode=arch=compute_90a,code=sm_90a
 LIBS := -lcublas -lcuda
 HEADERS := $(wildcard include/*.cuh kernels/*.cuh)

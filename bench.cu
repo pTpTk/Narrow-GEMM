@@ -20,13 +20,17 @@ using namespace narrow;
 struct Options {
   std::string kernel = "all", timing = "graph", pattern = "random", format = "table";
   int bn = 64, split = 4, iterations = 20, samples = 5, warmup = 3;
+  int stages = 2, batch_k = 2, workers_per_sm = 0;
 };
 
 void usage() {
   std::puts("Fixed BF16 GEMM: (M,N,K)=(64,4096,8192); FP32 output\n"
-      "  --kernel all|0|1|2|3|4|5|6|7   0=cuBLAS; 5..7=handwritten Hopper\n"
+      "  --kernel all|0|1|2|3|4|5|6|7|8   0=cuBLAS; 5..8=handwritten Hopper\n"
       "  --bn 32|64|128             tile width (default 64)\n"
-      "  --split 1|2|4|8|16|32      K partitions for 4..7 (default 4)\n"
+      "  --split 1|2|4|8|16|32      K partitions for 4..8 (default 4)\n"
+      "  --stages 2|4               input ring slots for 6..8 (default 2)\n"
+      "  --batch-k 1|2              64-wide K boxes per group for 6..8 (default 2)\n"
+      "  --workers-per-sm 0|1|2|4    persistent CTA cap; 0=occupancy (default)\n"
       "  --timing graph|events      default graph; both include reduction\n"
       "  --format table|csv         aligned table by default\n"
       "  --pattern random|ones|alternating   BF16 input (default random)\n"
@@ -56,12 +60,21 @@ Options parse(int argc, char** argv) {
     else if (key == "--iterations") o.iterations = integer();
     else if (key == "--samples") o.samples = integer();
     else if (key == "--warmup") o.warmup = integer();
+    else if (key == "--stages") o.stages = integer();
+    else if (key == "--batch-k") o.batch_k = integer();
+    else if (key == "--workers-per-sm") o.workers_per_sm = integer();
     else throw std::runtime_error("unknown option: " + key);
   }
   if (o.kernel != "all" && o.kernel != "0" && o.kernel != "1" &&
       o.kernel != "2" && o.kernel != "3" && o.kernel != "4" && o.kernel != "5" &&
-      o.kernel != "6" && o.kernel != "7")
-    throw std::runtime_error("kernel must be all or 0..7");
+      o.kernel != "6" && o.kernel != "7" && o.kernel != "8")
+    throw std::runtime_error("kernel must be all or 0..8");
+  if (o.stages != 2 && o.stages != 4)
+    throw std::runtime_error("stages must be 2 or 4");
+  if (o.batch_k != 1 && o.batch_k != 2)
+    throw std::runtime_error("batch-k must be 1 or 2");
+  if (o.workers_per_sm != 0 && o.workers_per_sm != 1 && o.workers_per_sm != 2 && o.workers_per_sm != 4)
+    throw std::runtime_error("workers-per-sm must be 0, 1, 2, or 4");
   if (o.bn != 32 && o.bn != 64 && o.bn != 128)
     throw std::runtime_error("bn must be 32, 64, or 128");
   if (o.split < 1 || o.split > 32 || (o.split & (o.split - 1)))
@@ -175,28 +188,42 @@ Timing measure(const Launch& run, cudaStream_t stream, const Options& o) {
 
 template <int BN>
 Launch prepare(int kernel, const bf16* a, const bf16* b, float* c,
-                float* partial, int split, cudaStream_t stream) {
+                float* partial, const Options& o, cudaStream_t stream) {
+  const int split = o.split;
   switch (kernel) {
     case 1: return [=] { launch_scalar(a, b, c, stream); };
-    case 2: return [=] { launch_mma<BN>(a, b, c, stream); };
-    case 3: return [=] { launch_async<BN>(a, b, c, 1, stream); };
-    case 4: return [=] { launch_split_k<BN>(a, b, c, partial, split, stream); };
-    case 5: case 6: case 7:
-      return prepare_hopper<BN>(kernel, a, b, c, partial, split, stream);
+    case 2:
+      configure_mma<BN>();
+      return [=] { launch_mma<BN>(a, b, c, stream); };
+    case 3:
+      configure_async<BN>();
+      return [=] { launch_async<BN>(a, b, c, 1, stream); };
+    case 4:
+      configure_async<BN>();
+      return [=] { launch_split_k<BN>(a, b, c, partial, split, stream); };
+    case 5: case 6: case 7: case 8:
+      return prepare_hopper<BN>(kernel, a, b, c, partial, split,
+                                o.stages, o.batch_k, o.workers_per_sm, stream);
     default: throw std::runtime_error("unsupported kernel");
   }
 }
 
 void print_row(int kernel, const Options& o, Timing t, double baseline) {
   const double tflops = (2. * M * N * K) / (t.median_us * 1.e6);
+  const int tile_k = kernel < 2 ? 0 : kernel <= 4 ? BK : kernel == 5 ? HopperBK : HopperBK * o.batch_k;
+  const int stages = kernel < 2 ? 0 : kernel == 2 || kernel == 5 ? 1 : kernel <= 4 ? 2 : o.stages;
+  const int workers = kernel == 7 ? o.workers_per_sm : 0;
   if (o.format == "csv") {
-    std::printf("%d,%d,%d,%s,%.6f,%.6f,%.6f,%.6f\n", kernel,
+    std::printf("%d,%d,%d,%s,%.6f,%.6f,%.6f,%.6f,%d,%d,%d\n", kernel,
         kernel < 2 ? 0 : o.bn, kernel >= 4 ? o.split : 1,
-        o.timing.c_str(), t.median_us, t.min_us, tflops, baseline / t.median_us);
+        o.timing.c_str(), t.median_us, t.min_us, tflops, baseline / t.median_us,
+        tile_k, stages, workers);
   } else {
-    std::printf("%-6d  %4d  %5d  %-6s  %12.3f  %12.3f  %12.2f  %11.3fx\n", kernel,
+    const std::string worker_label = kernel != 7 ? "-" : workers ? std::to_string(workers) : "auto";
+    std::printf("%-6d  %4d  %5d  %-6s  %6d  %6d  %6s  %12.3f  %12.3f  %12.2f  %11.3fx\n", kernel,
         kernel < 2 ? 0 : o.bn, kernel >= 4 ? o.split : 1,
-        o.timing.c_str(), t.median_us, t.min_us, tflops, baseline / t.median_us);
+        o.timing.c_str(), tile_k, stages, worker_label.c_str(),
+        t.median_us, t.min_us, tflops, baseline / t.median_us);
   }
 }
 
@@ -207,14 +234,14 @@ int main(int argc, char** argv) try {
   cudaDeviceProp prop{};
   CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
   if (prop.major != 9 || prop.minor != 0)
-    throw std::runtime_error("this tutorial targets Hopper SM90 (build uses sm_90a)");
+    throw std::runtime_error("this tutorial targets Hopper H100/H200 SM90 (build uses sm_90a)");
   CUDA_CHECK(cudaRuntimeGetVersion(&runtime));
   CUDA_CHECK(cudaDriverGetVersion(&driver));
   std::fprintf(stderr, "GPU=%s SMs=%d L2=%d CUDA_runtime=%d driver=%d\n"
       "M=%d N=%d K=%d A=row B=column C=row BF16->FP32 pattern=%s timing=%s\n"
-      "iterations=%d samples=%d warmup=%d seed=2026 cache=steady-state-same-addresses\n",
+      "iterations=%d samples=%d warmup=%d seed=2026 cache=steady-state-same-addresses warp_bk=%d\n",
       prop.name, prop.multiProcessorCount, prop.l2CacheSize, runtime, driver,
-      M, N, K, o.pattern.c_str(), o.timing.c_str(), o.iterations, o.samples, o.warmup);
+      M, N, K, o.pattern.c_str(), o.timing.c_str(), o.iterations, o.samples, o.warmup, BK);
 
   cudaStream_t stream;
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -241,13 +268,13 @@ int main(int argc, char** argv) try {
 
   std::vector<int> kernels;
   if (o.kernel == "all") {
-    kernels = {1, 2, 3, 4, 5, 6, 7};
+    kernels = {1, 2, 3, 4, 5, 6, 7, 8};
   } else if (o.kernel != "0") kernels.push_back(std::stoi(o.kernel));
   for (int kernel : kernels) {
     Launch run;
-    if (o.bn == 32) run = prepare<32>(kernel, a.data, b.data, c.data, partial.data, o.split, stream);
-    else if (o.bn == 64) run = prepare<64>(kernel, a.data, b.data, c.data, partial.data, o.split, stream);
-    else run = prepare<128>(kernel, a.data, b.data, c.data, partial.data, o.split, stream);
+    if (o.bn == 32) run = prepare<32>(kernel, a.data, b.data, c.data, partial.data, o, stream);
+    else if (o.bn == 64) run = prepare<64>(kernel, a.data, b.data, c.data, partial.data, o, stream);
+    else run = prepare<128>(kernel, a.data, b.data, c.data, partial.data, o, stream);
     // NaN poison catches unwritten outputs/partials. No zero initialization can
     // accidentally make a missing store look correct on structured inputs.
     CUDA_CHECK(cudaMemsetAsync(c.data, 0xff, ElementsC * sizeof(float), stream));
@@ -269,10 +296,11 @@ int main(int argc, char** argv) try {
   // Emit the complete table after all correctness/setup diagnostics, including
   // when stdout and stderr share a terminal or are redirected into one log.
   if (o.format == "csv")
-    std::puts("kernel,bn,split,timing,median_us,min_us,tflops,speedup_vs_cublas");
+    std::puts("kernel,bn,split,timing,median_us,min_us,tflops,speedup_vs_cublas,tile_k,stages,workers_per_sm");
   else
-    std::printf("%-6s  %4s  %5s  %-6s  %12s  %12s  %12s  %12s\n",
-        "Kernel", "BN", "Split", "Timing", "Median us", "Min us", "TFLOP/s", "Speedup");
+    std::printf("%-6s  %4s  %5s  %-6s  %6s  %6s  %6s  %12s  %12s  %12s  %12s\n",
+        "Kernel", "BN", "Split", "Timing", "K tile", "Stages", "CTA/SM",
+        "Median us", "Min us", "TFLOP/s", "Speedup");
   for (const Result& result : results)
     print_row(result.kernel, o, result.timing, base.median_us);
   return 0;

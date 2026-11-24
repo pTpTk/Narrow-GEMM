@@ -25,7 +25,7 @@ The inspected source reference is **v3.9.2**, commit
 | Source | What to inspect | Connection to this tutorial |
 | --- | --- | --- |
 | [Hopper builder example](https://github.com/NVIDIA/cutlass/blob/ad7b2f5e84fcfa124cb02b91d5bd26d238c0459e/examples/49_hopper_gemm_with_collective_builder/49_collective_builder.cu) | Tile, pipeline and epilogue resource choices | Background only; no builders are called |
-| [SM90 TMA warp-specialized kernel](https://github.com/NVIDIA/cutlass/blob/ad7b2f5e84fcfa124cb02b91d5bd26d238c0459e/include/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized.hpp) | Producer/consumer groups and shared-storage lifetimes | Ideas implemented directly in our stages 5–7 |
+| [SM90 TMA warp-specialized kernel](https://github.com/NVIDIA/cutlass/blob/ad7b2f5e84fcfa124cb02b91d5bd26d238c0459e/include/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized.hpp) | Producer/consumer groups and shared-storage lifetimes | Ideas implemented directly in our stages 5–8 |
 | [SM90 pipeline](https://github.com/NVIDIA/cutlass/blob/ad7b2f5e84fcfa124cb02b91d5bd26d238c0459e/include/cutlass/pipeline/sm90_pipeline.hpp) | Full/empty transaction barriers and ring phases | Compare with our explicit barrier protocol and cross-job phase counters |
 | [PTX barrier wrappers](https://github.com/NVIDIA/cutlass/blob/ad7b2f5e84fcfa124cb02b91d5bd26d238c0459e/include/cutlass/arch/barrier.h) | Initialization fences, parity waits and transaction byte counts | Instruction semantics checked against our local PTX wrappers |
 | [TMA instruction wrappers](https://github.com/NVIDIA/cutlass/blob/ad7b2f5e84fcfa124cb02b91d5bd26d238c0459e/include/cute/arch/copy_sm90_tma.hpp) | Descriptor and shared address operands | Instruction reference; the helper is not included or called |
@@ -63,8 +63,8 @@ Specific observations from that snapshot:
 - Its BF16 kernel waits for WGMMA completion before signaling an operand slot
   empty. More advanced overlap must preserve that operand lifetime.
 - Some stages can be merged to reduce WGMMA-wait overhead under specific
-  conditions. We explain the cost but do not copy that optimization into the
-  simpler three-stage handwritten exercise.
+  conditions. Our optional two-chunk groups test the same barrier/wait
+  amortization idea with a smaller, explicitly bounded candidate set.
 
 ## Hardware and instruction documentation
 

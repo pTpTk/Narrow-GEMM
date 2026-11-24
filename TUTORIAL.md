@@ -11,6 +11,10 @@ fix, and keep a cuBLAS baseline throughout. The format is inspired by
 The objective here is to understand the decisions for a narrow shape. Whether
 our implementation beats cuBLAS is an experiment to run, not a promised result.
 
+For H200 MIG, read the [offline tuning follow-up](docs/H200_MIG.md): it records
+the user-reported starting measurements and the new unmeasured candidates.
+The full-chip H100 model below should not be scaled blindly to a MIG profile.
+
 All numerical performance estimates below are **analytical models**. There are
 no measured speedups in this document. The companion code was compile-checked;
 the authoring environment has no GPU. See [the validation record](docs/VALIDATION.md).
@@ -148,13 +152,16 @@ performance difference cannot be attributed to Tensor Cores alone.
 ## Kernel 2: reuse inputs and let Tensor Cores do the arithmetic
 
 Open [02_mma.cuh](kernels/02_mma.cuh) and [tile.cuh](kernels/tile.cuh).
-Start with `BM=64`, `BN=64`, `BK=32`, and four warps per CTA:
+The current build starts with `BM=64`, `BN=64`, `BK=64`, and four warps per CTA.
+`make -B WARP_BK=32` restores the original K tile; `WARP_BK=128` is another
+compile-checked candidate. Larger BK amortizes outer-loop barriers but costs
+shared memory and can lower residency:
 
-1. Copy a `64 x 32` A tile and a `32 x BN` B tile into shared memory.
+1. Copy a `64 x BK` A tile and a `BK x BN` B tile into shared memory.
 2. Synchronize the block.
 3. Multiply them with raw warp-level `16 x 8 x 16` BF16 `mma.sync` instructions.
 4. Synchronize before overwriting shared memory.
-5. Advance K by 32. After all K chunks, store FP32 C.
+5. Advance K by BK. After all K chunks, store FP32 C.
 
 Each warp owns **16 rows and all BN columns** of the output. A warp therefore
 holds `BN/8` groups of four FP32 registers. The four warps cover 64 rows without
@@ -376,7 +383,8 @@ This serial version makes the instruction and layout changes reviewable before
 we add independent producer/consumer warpgroups.
 
 We choose `BM=64`, `BK=64`, and retain `BN={32,64,128}`. Moving from stage 4 to
-5 changes both the MMA instruction and the copy mechanism, as well as BK.
+5 changes both the MMA instruction and the copy mechanism. Hopper BK stays
+64 independently of the compile-time warp-MMA BK setting.
 It is not an isolated measurement of any one instruction's benefit.
 
 ### Encode the input tensor maps
@@ -489,80 +497,76 @@ The second command still includes the final FP32 reduction. Descriptor encoding
 and launch attribute setup happen before timing. Read the entire stage: it is
 short because we specialize one layout, not because a library hides the math.
 
-## Kernel 6: give loading its own warpgroup and three queue slots
+## Kernel 6: use a producer warp and batch the completion rounds
 
-Open [06_warp_specialized.cuh](kernels/06_warp_specialized.cuh). We now launch
-256 threads: consumers 0..127, producers 128..255. Thread 128 issues the TMA
-loads; the remaining producer threads participate in block setup/drain. This
-full producer group also gives the next stage a place to release registers.
+Open [06_warp_specialized.cuh](kernels/06_warp_specialized.cuh). The tuned
+version has **160 threads**: one 128-thread consumer warpgroup and a single
+32-thread producer warp. Thread 128 issues TMA loads. A full 128-thread producer
+warpgroup is unnecessary when one thread issues all transfers and the tile
+does not need an asymmetric register budget.
 
-We keep three input slots. Each slot has two independent mbarriers:
+Two parameters make the tradeoff explicit:
 
-| Barrier | Initial arrival count | Completion condition |
-| --- | ---: | --- |
-| full | 1 | The issuer arrives and both TMA tile transfers complete |
-| empty | 128 | Every consumer has finished WGMMA reads and arrived |
+- `--stages 2|4` is the number of queue slots.
+- `--batch-k 1|2` is the number of K=64 chunks in each slot.
 
-Producer and consumer run independent loops. For K-step ordinal `tick`, let
-`slot=tick%3` and `round=tick/3`:
+With batch-K=2, four TMA instructions load two A boxes and two B boxes. One full
+barrier tracks their **combined byte count**. The consumer issues eight WGMMA
+instructions, commits one group, waits for it, and releases the slot. Each
+chunk has its own 1024-byte-aligned base and the same 128-byte swizzle as stage
+5. Enlarging the contiguous TMA box to 256 bytes instead would violate this
+particular descriptor/swizzle contract.
+
+The `SteadyWgmmaAccumulators` path clears FP32 registers before the K loop and
+uses accumulating MMA instructions throughout the loop. It removes the branch
+between overwrite and accumulation inside the async group. The original stage
+5 retains that branch as the serial reference. In CUDA 12.6.85 compile checks,
+the tuned path avoids the earlier serialization diagnostics. That establishes
+a code-generation improvement, not a measured throughput gain.
+
+### Four releases are enough
+
+Each full barrier has arrival count one. Each empty barrier has count **four**:
+after completing its WGMMA wait, lane zero of each consumer warp arrives once.
+The original implementation made all 128 consumer threads arrive. Releasing a
+slot still requires all consuming warps; it just avoids redundant lane arrivals.
+
+For global chunk-group ordinal `tick`, let `slot=tick%Stages` and
+`round=tick/Stages`:
 
 ```text
 producer:
     if round > 0:
         wait for empty[slot] phase ((round-1) & 1) to complete
-    full[slot].arrive_expect_tx(A_bytes + B_bytes)
-    issue TMA(A) and TMA(B) into slot
+    full[slot].arrive_expect_tx(batch_k * (A_box_bytes + B_box_bytes))
+    issue both input boxes for each K chunk
 
 all 128 consumers:
     wait for full[slot] phase (round & 1) to complete
-    issue four WGMMA operations
+    issue the group's MMA instructions
     commit and wait_group 0
-    empty[slot].arrive()
+    lane zero of each warp arrives at empty[slot]
 ```
 
-Initially every slot is free: the producer skips the first three empty waits.
-It must not wait for an uncompleted initial empty barrier. On reuse, it waits
-for the **previous** generation's empty phase. The consumer waits for the
-**current** generation's full phase. Confusing those two generations can make
-a queue deadlock or consume a tile from an earlier pass through the ring.
-
-There are no CTA-wide barriers inside the independent loops. A CTA barrier
-there would wait for the producer threads while the producer might itself be
-waiting for those consumers. The only block barriers are setup and final drain.
-Each consumer releases a slot only after its WGMMA group is complete. Commit
-is not completion; releasing immediately after commit permits an operand race.
-
-```text
-producer: load 0 -> load 1 -> load 2 -> wait empty 0 -> load 3 -> ...
-consumer:           wait full 0 -> MMA 0 -> release 0 -> MMA 1 -> ...
-```
-
-The `wait_group 0` after each BK chunk is a conservative lifetime rule.
-Multiple WGMMA groups in flight could further overlap MMA issue, but would
-require delaying the corresponding empty arrivals. We do not claim that this
-three-slot queue is the same as that deeper MMA pipeline.
+Initial slots are free, so their first empty waits are skipped. On reuse, the
+producer waits for the previous generation's release; consumers wait for the
+current generation's data. No CTA barrier belongs inside these independent
+loops: it could make consumers wait for a producer that is itself waiting for
+those consumers. Setup and final drain use block synchronization.
 
 ```bash
-../build/narrow_gemm --kernel 6 --bn 64 --split 4
+../build/narrow_gemm --kernel 6 --bn 64 --split 4 --stages 2 --batch-k 2
+../build/narrow_gemm --kernel 6 --bn 64 --split 4 --stages 4 --batch-k 1
 ```
 
-At BM=BN=BK=64 each input slot is 16 KiB; three input slots require 48 KiB.
-Our complete shared struct also contains barriers and 1024-byte alignment
-padding. The plan prints its actual `sizeof` allocation. Input buffering grows
-with BN and competes with CTA residency. Try changing `Stages` in
-[07_persistent.cuh](kernels/07_persistent.cuh) to four or five and rebuild.
-DeepGEMM's inspected small-tile filter requires at least four stages in its
-own design; that is a tuning heuristic, not an instruction requirement.
+These two configurations have the same input capacity but different completion
+frequency and queue granularity. Two slots with batch-K=1 cost less shared
+memory and may allow more resident CTAs. The plan logs the real allocation and
+CUDA's residency estimate before timing. Do not assume the deepest ring wins.
 
-**What to measure:** complete runtime versus stage 5, load stalls, producer
-waits, active SMs and shared-memory footprint. More stages do not repair an
-undersized output grid; use the same BN and split when comparing stages.
+## Kernel 7: retain workers without starving a smaller GPU partition
 
-## Kernel 7: reuse workers and redistribute their registers
-
-The launch setup in [07_persistent.cuh](kernels/07_persistent.cuh) selects the
-persistent specialization of our stage-6 kernel. It bounds worker CTAs at
-`min(logical_jobs, SM_count)` and assigns their jobs explicitly:
+Stage 7 uses the same producer/consumer code and a worker-stride job loop:
 
 ```text
 job = blockIdx.x
@@ -573,50 +577,71 @@ while job < (N/BN)*S:
     job += gridDim.x
 ```
 
-That is the whole scheduler. It does not call an upstream scheduler, guarantee
-one CTA per physical SM, or create more logical work. With BN=64 and S=1 there
-are still only 64 jobs; with S=4, 256 jobs can be divided among up to 132 workers.
-Persistent scheduling is worth testing only after sufficient jobs exist.
+The first implementation limited the grid to one worker per SM and requested a
+128-register consumer budget. The user's H200 3g.71gb measurement found this
+slower than the serial stage. Those settings are not retained as the defaults:
+a narrow memory-bound kernel can need several independent CTAs per SM, and a
+64x64 output has only 32 accumulator registers per consumer thread.
 
-### Carry ring generations across output tiles
+[07_persistent.cuh](kernels/07_persistent.cuh) now configures the kernel's real
+shared-memory footprint, queries legal CTA residency, and caps the grid at
+`visible_SM_count * resident_CTAs_per_SM`. The driver reports the MIG device's
+visible SM count; no full-chip constant enters this launch policy. Normal
+compiler register allocation replaces forced redistribution. The explicit
+`setmaxnreg` wrappers remain available for separate resource experiments but
+are not called by the tuned kernels.
 
-The producer can begin fetching the next job while the consumers store the
-previous output. Their `tick` counters increase across **all** K steps and jobs
-assigned to the worker. We do not reset queue phases at each output tile.
-For example, K/S=2048 gives 32 steps; with three slots, the next job starts at
-slot two, not slot zero. Resetting the consumer to slot zero at that boundary
-would disagree with the producer. Accumulation does reset logically: the first
-MMA of each new job uses scale-D=false.
-
-### Stop reserving consumer-sized register budgets for a TMA issuer
-
-The producer has no FP32 output tile. Its job is coordinates, descriptors and
-queue state. Stage 7 has all 128 producer threads execute
-`setmaxnreg.dec.sync.aligned.u32 40`; all 128 consumer threads execute
-`setmaxnreg.inc.sync.aligned.u32 128`. The instructions are warpgroup-collective
-and appear in warpgroup-uniform branches. Allocating registers is a hardware
-resource operation, not a C++ array declaration or a promise that occupancy
-will increase.
-
-The consumer budget includes BN/2 accumulators plus descriptor/index state;
-the producer budget is smaller. Inspect compiler resource reports, spills and
-actual residency when tuning these constants. Excessive consumer requests can
-stall waiting for registers. Do not copy a large-tile library's 240-register
-budget into this smaller tile without accounting for the full CTA.
-
-Stage 7 combines persistence and register redistribution as an endpoint.
-To isolate their effects, change the final `true` template argument to `false`
-in **both** stage-7 configure and launch calls. The `Persistent` and
-`Redistribute` parameters are separate precisely for this experiment.
+`--workers-per-sm 0` selects the occupancy-based cap. `1`, `2`, and `4` request
+smaller or larger caps, clamped to legal residency. This is still an unmeasured
+policy, not a guarantee that maximal residency or persistence is fastest.
 
 ```bash
-../build/narrow_gemm --kernel 7 --bn 64 --split 4
-../build/narrow_gemm --kernel 7 --bn 128 --split 8
+../build/narrow_gemm --kernel 7 --bn 64 --split 4 --workers-per-sm 0
+../build/narrow_gemm --kernel 7 --bn 64 --split 4 --workers-per-sm 1
 ```
 
-All stages still use the same FP32 reduction and the same correctness checks.
-Keeping the operands' lifetimes, phase accounting, scheduling, register tuples
-and stores in these local files is what makes this a from-scratch exercise.
+Producer and consumer `tick` counters continue across every job assigned to a
+worker. Do not reset ring phases at output-tile boundaries. For split=32,
+batch-K=2 there are only two chunk groups per job; a four-slot ring crosses job
+boundaries midway through a ring traversal. Accumulation does reset: registers
+are cleared before the next logical output tile, after the previous MMA wait.
+The producer may prefetch that next job while consumers store the previous C.
+
+## Kernel 8: can one warpgroup do the copying as well?
+
+[08_cooperative.cuh](kernels/08_cooperative.cuh) tests a different answer to
+producer overhead: use **128 threads total**. Thread zero issues future TMA
+loads, then joins the rest of its warpgroup for WGMMA. TMA remains asynchronous;
+a separate producer warp is not required for transfer/compute overlap.
+
+The prologue loads up to `Stages-1` groups. At iteration t, thread zero issues
+group `t+Stages-1` into a different slot before waiting for and consuming group
+t. A final block barrier ensures all WGMMA reads of the current slot have
+completed before the next iteration can refill it:
+
+```text
+two slots:
+    prologue: issue group 0
+    step 0: issue group 1; wait 0; MMA 0; wait MMA; CTA sync
+    step 1: issue group 2; wait 1; MMA 1; wait MMA; CTA sync
+    step 2: issue group 3; wait 2; MMA 2; wait MMA; CTA sync
+```
+
+There are no empty-slot barriers, dedicated producer threads, register
+redistribution instructions or persistent job loop in this variant. It trades
+independent producer progress for less control overhead and a smaller CTA.
+It is particularly worth measuring when the serial TMA stage already beats
+the more elaborate pipeline, as in the user's MIG result.
+
+```bash
+../build/narrow_gemm --kernel 8 --bn 64 --split 2 --stages 2 --batch-k 2
+python3 scripts/sweep.py --profile h200-mig --kernels 5,8 --csv ../h200-first.csv
+```
+
+The profile supplies candidates, not measured winners. Keep the full-output
+checks, include split-K reduction in the timer, and compare against the fresh
+cuBLAS baseline in each row. The [H200 tuning notes](docs/H200_MIG.md) preserve
+the original measurements and explain the reduced sweep.
 
 ## What to borrow from DeepGEMM, and what to leave as another experiment
 
@@ -699,8 +724,9 @@ first pass should answer a small sequence of questions:
 | S=1 vs 2 vs 4 vs 8 | Does more K parallelism pay for reduction? | Full runtime and reduction breakdown |
 | Stage 4 vs 5 | Does raw TMA/WGMMA help overall? | Same types, BN and S; full runtime |
 | Stage 5 vs 6 | Does a specialized producer and input ring help? | Load stalls, shared footprint, complete runtime |
-| Stage 6 vs 7 | Do persistence and asymmetric registers help? | Job count, residency; isolate each template switch |
-| TMA stages 3 vs 4 vs 5 | Is more buffering worth the resources? | Shared footprint, stalls, complete runtime |
+| Stage 6 vs 7 | Does persistence with enough workers help? | Visible SMs, legal residency and worker cap |
+| Stage 5 vs 8 | Is cooperative prefetch cheaper than a producer? | Same BN/split, input capacity and complete runtime |
+| Slots 2 vs 4; batch-K 1 vs 2 | Is buffering or fewer completion rounds more valuable? | Shared footprint, stalls, complete runtime |
 
 The driver records median and minimum of multiple batch-average timings.
 `TFLOP/s = 4294.967296 / time_us`. A speedup above one means faster than that
@@ -752,7 +778,8 @@ Fill in your measured table rather than copying numbers from another GPU:
 | Split-K warp MMA | 64 | 2/4/8 | unmeasured | unmeasured | unmeasured |
 | Serial TMA/WGMMA | 64 | best measured S | unmeasured | unmeasured | unmeasured |
 | Specialized ring | 64 | best measured S | unmeasured | unmeasured | unmeasured |
-| Persistent + register budgets | 64 | best measured S | unmeasured | unmeasured | unmeasured |
+| Persistent worker grid | 64 | best measured S | unmeasured | unmeasured | unmeasured |
+| Cooperative TMA | 64 | best measured S | unmeasured | unmeasured | unmeasured |
 
 For this one shape, a defensible tuning order is: preserve the indexing and
 numerics, get Tensor Cores working, select a tile with enough useful work,

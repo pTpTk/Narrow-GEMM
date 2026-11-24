@@ -11,7 +11,11 @@ namespace narrow {
 
 // The entire exercise specializes one problem. B is physically [N][K].
 constexpr int M = 64, N = 4096, K = 8192;
-constexpr int BM = 64, BK = 32, Threads = 128;
+#ifndef NARROW_WARP_BK
+#define NARROW_WARP_BK 64
+#endif
+constexpr int BM = 64, BK = NARROW_WARP_BK, Threads = 128;
+static_assert(BK == 32 || BK == 64 || BK == 128);
 constexpr size_t ElementsC = size_t(M) * N;
 using bf16 = __nv_bfloat16;
 using Launch = std::function<void()>;

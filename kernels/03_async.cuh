@@ -7,7 +7,8 @@ namespace narrow {
 // Runtime split permits a small sweep without compiling many identical kernels.
 template <int BN>
 __global__ void async_gemm(const bf16* a, const bf16* b, float* out, int split) {
-  __shared__ Tiles<BN, 2> smem;
+  extern __shared__ __align__(32) unsigned char warp_storage[];
+  auto& smem = *reinterpret_cast<Tiles<BN, 2>*>(warp_storage);
   const int length = K / split;
   const int first = blockIdx.y * length;
   const int iterations = length / BK;
@@ -40,9 +41,15 @@ __global__ void async_gemm(const bf16* a, const bf16* b, float* out, int split) 
 }
 
 template <int BN>
+inline void configure_async() {
+  CUDA_CHECK(cudaFuncSetAttribute(async_gemm<BN>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Tiles<BN, 2>)));
+}
+
+template <int BN>
 inline void launch_async(const bf16* a, const bf16* b, float* out, int split,
                          cudaStream_t stream) {
-  async_gemm<BN><<<dim3(N / BN, split), Threads, 0, stream>>>(a, b, out, split);
+  async_gemm<BN><<<dim3(N / BN, split), Threads, sizeof(Tiles<BN, 2>), stream>>>(a, b, out, split);
 }
 
 }  // namespace narrow
