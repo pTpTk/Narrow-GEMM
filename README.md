@@ -88,8 +88,9 @@ go to stderr. Once all cases finish, stdout prints one aligned table grouped
 by kernel, tile width and split. Each row includes its own run's cuBLAS time and
 speedup; repeated baseline rows are omitted from this readable summary.
 `--csv PATH` also saves full-precision records with every local baseline, and
-`--format csv` selects that format for stdout. The benchmark binary itself also
-emits its CSV rows together after all checks. On failure the sweep prints only
+`--format csv` selects that format for stdout. The benchmark binary also defaults
+to a padded table; pass it `--format csv` for machine-readable output. The sweep
+requests that CSV mode automatically. On failure the sweep prints only
 completed cases and exits unsuccessfully. Keep CSV, logs, downloaded libraries,
 build output and profiler reports in the parent workspace.
 

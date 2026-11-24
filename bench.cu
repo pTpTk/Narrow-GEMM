@@ -18,7 +18,7 @@
 using namespace narrow;
 
 struct Options {
-  std::string kernel = "all", timing = "graph", pattern = "random";
+  std::string kernel = "all", timing = "graph", pattern = "random", format = "table";
   int bn = 64, split = 4, iterations = 20, samples = 5, warmup = 3;
 };
 
@@ -28,9 +28,10 @@ void usage() {
       "  --bn 32|64|128             tile width (default 64)\n"
       "  --split 1|2|4|8|16|32      K partitions for 4..7 (default 4)\n"
       "  --timing graph|events      default graph; both include reduction\n"
+      "  --format table|csv         aligned table by default\n"
       "  --pattern random|ones|alternating   BF16 input (default random)\n"
       "  --iterations INT --samples INT --warmup INT\n"
-      "CSV goes to stdout; metadata and correctness diagnostics to stderr.");
+      "Results go to stdout; metadata and correctness diagnostics to stderr.");
 }
 
 Options parse(int argc, char** argv) {
@@ -49,6 +50,7 @@ Options parse(int argc, char** argv) {
     if (key == "--kernel") o.kernel = value;
     else if (key == "--timing") o.timing = value;
     else if (key == "--pattern") o.pattern = value;
+    else if (key == "--format") o.format = value;
     else if (key == "--bn") o.bn = integer();
     else if (key == "--split") o.split = integer();
     else if (key == "--iterations") o.iterations = integer();
@@ -66,6 +68,8 @@ Options parse(int argc, char** argv) {
     throw std::runtime_error("split must be a power of two from 1 to 32");
   if (o.timing != "graph" && o.timing != "events")
     throw std::runtime_error("timing must be graph or events");
+  if (o.format != "table" && o.format != "csv")
+    throw std::runtime_error("format must be table or csv");
   if (o.pattern != "random" && o.pattern != "ones" && o.pattern != "alternating")
     throw std::runtime_error("pattern must be random, ones, or alternating");
   if (o.iterations < 1 || o.iterations > 10000 || o.samples < 1 || o.samples > 1000 ||
@@ -185,9 +189,15 @@ Launch prepare(int kernel, const bf16* a, const bf16* b, float* c,
 
 void print_row(int kernel, const Options& o, Timing t, double baseline) {
   const double tflops = (2. * M * N * K) / (t.median_us * 1.e6);
-  std::printf("%d,%d,%d,%s,%.6f,%.6f,%.6f,%.6f\n", kernel,
-      kernel < 2 ? 0 : o.bn, kernel >= 4 ? o.split : 1,
-      o.timing.c_str(), t.median_us, t.min_us, tflops, baseline / t.median_us);
+  if (o.format == "csv") {
+    std::printf("%d,%d,%d,%s,%.6f,%.6f,%.6f,%.6f\n", kernel,
+        kernel < 2 ? 0 : o.bn, kernel >= 4 ? o.split : 1,
+        o.timing.c_str(), t.median_us, t.min_us, tflops, baseline / t.median_us);
+  } else {
+    std::printf("%-6d  %4d  %5d  %-6s  %12.3f  %12.3f  %12.2f  %11.3fx\n", kernel,
+        kernel < 2 ? 0 : o.bn, kernel >= 4 ? o.split : 1,
+        o.timing.c_str(), t.median_us, t.min_us, tflops, baseline / t.median_us);
+  }
 }
 
 int main(int argc, char** argv) try {
@@ -258,7 +268,11 @@ int main(int argc, char** argv) try {
   CUDA_CHECK(cudaStreamDestroy(stream));
   // Emit the complete table after all correctness/setup diagnostics, including
   // when stdout and stderr share a terminal or are redirected into one log.
-  std::puts("kernel,bn,split,timing,median_us,min_us,tflops,speedup_vs_cublas");
+  if (o.format == "csv")
+    std::puts("kernel,bn,split,timing,median_us,min_us,tflops,speedup_vs_cublas");
+  else
+    std::printf("%-6s  %4s  %5s  %-6s  %12s  %12s  %12s  %12s\n",
+        "Kernel", "BN", "Split", "Timing", "Median us", "Min us", "TFLOP/s", "Speedup");
   for (const Result& result : results)
     print_row(result.kernel, o, result.timing, base.median_us);
   return 0;

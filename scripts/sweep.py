@@ -34,7 +34,9 @@ def print_table(measurements, timing):
                      f"{float(row['median_us']):.3f}", f"{float(row['min_us']):.3f}",
                      f"{float(row['tflops']):.2f}", f"{baseline:.3f}",
                      f"{float(row['speedup_vs_cublas']):.3f}x"))
-    widths = [max(len(row[i]) for row in [headers, *rows]) for i in range(len(headers))]
+    minimum_widths = (20, 4, 5, 12, 12, 12, 12, 10)
+    widths = [max(minimum_widths[i], *(len(row[i]) for row in [headers, *rows]))
+              for i in range(len(headers))]
 
     def line(row):
         return "  ".join(value.ljust(width) if i == 0 else value.rjust(width)
@@ -74,7 +76,7 @@ def main():
     for index, (kernel, bn, split) in enumerate(configs, 1):
         cmd = [str(args.binary.resolve()), "--kernel", str(kernel), "--bn", str(bn),
                "--split", str(split), "--iterations", str(args.iterations),
-               "--samples", str(args.samples), "--timing", args.timing]
+               "--samples", str(args.samples), "--timing", args.timing, "--format", "csv"]
         print(f"[{index}/{len(configs)}] kernel={kernel} BN={bn} split={split}",
               file=sys.stderr, flush=True)
         try:
